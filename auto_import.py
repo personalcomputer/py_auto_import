@@ -54,8 +54,13 @@ PRELOADED_IMPORTS_DB.update({
 })
 
 
-def get_command_output(cmd, stdin=None):
-    raw_output, _ = subprocess.Popen(cmd, stdout=subprocess.PIPE, stdin=subprocess.PIPE).communicate(stdin)
+def get_command_output(cmd, stdin=None, cwd=None):
+    raw_output, _ = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stdin=subprocess.PIPE,
+        cwd=cwd
+    ).communicate(stdin)
     return raw_output.decode('utf-8')
 
 
@@ -75,11 +80,11 @@ def module_path_join(*modules):
 def construct_import_statement(terms):
     statement = ''
     if terms[0]:
-        statement += f'from {terms[0]} '
+        statement += 'from {} '.format(terms[0])
     if terms[1]:
-        statement += f'import {terms[1]} '
+        statement += 'import {} '.format(terms[1])
     if terms[2]:
-        statement += f'as {terms[2]} '
+        statement += 'as {} '.format(terms[2])
     return statement.strip()
 
 
@@ -94,28 +99,29 @@ def build_imports_database(project_root_path):
     # Scan your current project's codebase for import statement patterns, to see how you commonly import different
     # names.
     # (Outsources the core file regex searching to a highly optimized utility.)
-    ag_output = get_command_output(
-        ['ag', '--python', r'^(?:from [a-zA-Z_0-9 .,]+ )?import \(?[a-zA-Z_0-9 ,]+\)?', project_root_path])
+    if project_root_path is not None:
+        ag_output = get_command_output(
+            ['ag', '--python', r'^(?:from [a-zA-Z_0-9 .,]+ )?import \(?[a-zA-Z_0-9 ,]+\)?', project_root_path])
 
-    matches = re.findall(
-        r'(?:from ([a-zA-Z_0-9 .,]+) )?'
-        r'import \(?([a-zA-Z_0-9 ,]+)\)?'
-        r'(?: as ([a-zA-Z_0-9.]+))?',
-        ag_output
-    )
-    for match in matches:
-        import_base = match[0] if match[0] else None
-        import_list = [term.strip() for term in match[1].split(',')]
-        import_alias = match[2] if match[2] else None
-        if import_alias:
-            import_freq_db[import_alias][
-                (import_base, import_list[0], import_alias)] += 1
-            logging.debug(f'Found an import pattern for {import_alias}')
-        else:
-            for term in import_list:
-                import_freq_db[term][
-                    (import_base, term, import_alias)] += 1
-            logging.debug(f'Found an import pattern for {term}')
+        matches = re.findall(
+            r'(?:from ([a-zA-Z_0-9 .,]+) )?'
+            r'import \(?([a-zA-Z_0-9 ,]+)\)?'
+            r'(?: as ([a-zA-Z_0-9.]+))?',
+            ag_output
+        )
+        for match in matches:
+            import_base = match[0] if match[0] else None
+            import_list = [term.strip() for term in match[1].split(',')]
+            import_alias = match[2] if match[2] else None
+            if import_alias:
+                import_freq_db[import_alias][
+                    (import_base, import_list[0], import_alias)] += 1
+                logging.debug('Found an import pattern for {}'.format(import_alias))
+            else:
+                for term in import_list:
+                    import_freq_db[term][
+                        (import_base, term, import_alias)] += 1
+                    logging.debug('Found an import pattern for {}'.format(term))
 
     # Convert the temporary database of input patterns + their frequency to a simplified database which only provides
     # each name's single most frequently used input pattern.
@@ -134,10 +140,14 @@ def get_imports_database(project_root_path):
         'py_auto_import',
         'db_cache',
     )
-    root_path_hash = hashlib.md5(project_root_path.encode('utf-8')).hexdigest()
+    if project_root_path is None:
+        project_root_path_str = 'none'
+    else:
+        project_root_path_str = project_root_path
+    root_path_hash = hashlib.md5(project_root_path_str.encode('utf-8')).hexdigest()
     cache_path = os.path.join(
         DATABASE_CACHES_PATH,
-        get_valid_filename(os.path.basename(project_root_path) + '_' + root_path_hash) + '.pickle'
+        get_valid_filename(os.path.basename(project_root_path_str) + '_' + root_path_hash) + '.pickle'
     )
 
     if os.path.exists(cache_path):
@@ -153,15 +163,17 @@ def get_imports_database(project_root_path):
     return db
 
 
-def get_project_root_path():
+def get_project_root_path(code_base_dir):
+    if code_base_dir is None:
+        return None
     try:
-        git_repo_root = get_command_output(['git', 'rev-parse', '--show-toplevel']).strip()
+        git_repo_root = get_command_output(['git', 'rev-parse', '--show-toplevel'], cwd=code_base_dir).strip()
         if git_repo_root:
             return git_repo_root
     except FileNotFoundError:
         pass
 
-    return os.path.abspath('.')
+    return code_base_dir
 
 
 def get_undefined_references(code):
@@ -180,12 +192,12 @@ def get_undefined_references(code):
     return undefined_references
 
 
-def get_missing_import_statements(code):
+def get_missing_import_statements(code, code_base_dir):
     # Find undefined references (an undefined reference is potentially indicative of a missing module import)
     undefined_references = get_undefined_references(code)
 
     # Attempt to identify the import statements that satisfy the undefined references
-    root_path = get_project_root_path()
+    root_path = get_project_root_path(code_base_dir=code_base_dir)
     db = get_imports_database(root_path)
 
     needed_import_statements = set()
@@ -199,7 +211,7 @@ def get_missing_import_statements(code):
         elif name_base in db:
             needed_import_statements.add(construct_import_statement(db[name_base]))
         else:
-            logging.warning(f'Not able to find how to import \'{name}\'')
+            logging.warning('Not able to find how to import \'{}\''.format(name))
 
     return needed_import_statements
 
@@ -224,24 +236,25 @@ def main():
 
     # Parse Args
     parser = argparse.ArgumentParser()
+    parser.add_argument('file', help='file to fix or \'-\' for standard in')
     parser.add_argument(
-        'files', help='files to fix or \'-\' for standard in'
+        'base_dir',
+        default='x',
+        help='the filesystem context for where the code would be, if using standard in (default=.)'
     )
     args = parser.parse_args()
 
     # Load Specified File
-    if args.files == '-':
+    if args.file == '-':
         code = sys.stdin.read().decode('utf-8')
+        code_base_dir = os.path.abspath(args.base_dir)
     else:
-        if ' ' in args.files:
-            raise NotImplementedError(
-                'Sorry, using more than one file argument has not been implemented, '
-                'please specify one file per invocation')
-        with open(args.files) as input_file:
+        with open(args.file) as input_file:
             code = input_file.read()
+        code_base_dir = os.path.dirname(os.path.abspath(args.file))
 
     # Find missing import statements
-    needed_import_statements = get_missing_import_statements(code)
+    needed_import_statements = get_missing_import_statements(code, code_base_dir)
 
     # Output
     if needed_import_statements:
