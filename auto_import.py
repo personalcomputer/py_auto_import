@@ -127,6 +127,32 @@ def build_imports_database(project_root_path):
     return import_db
 
 
+def get_imports_database(project_root_path):
+    DATABASE_CACHE_EXPIRY = datetime.timedelta(minutes=15)
+    DATABASE_CACHES_PATH = os.path.join(
+        os.environ.get('XDG_DATA_HOME', os.path.expanduser('~/.local/share')),
+        'py_auto_import',
+        'db_cache',
+    )
+    root_path_hash = hashlib.md5(project_root_path.encode('utf-8')).hexdigest()
+    cache_path = os.path.join(
+        DATABASE_CACHES_PATH,
+        get_valid_filename(os.path.basename(project_root_path) + '_' + root_path_hash) + '.pickle'
+    )
+
+    if os.path.exists(cache_path):
+        cache_mtime = datetime.datetime.utcfromtimestamp(os.path.getmtime(cache_path))
+        if (datetime.datetime.now() - cache_mtime) < DATABASE_CACHE_EXPIRY:
+            with open(cache_path, 'rb') as cache_file:
+                return pickle.load(cache_file)
+
+    db = build_imports_database(project_root_path)
+    os.makedirs(DATABASE_CACHES_PATH, exist_ok=True)
+    with open(cache_path, 'wb') as cache_file:
+        pickle.dump(db, cache_file)
+    return db
+
+
 def get_project_root_path():
     try:
         git_repo_root = get_command_output(['git', 'rev-parse', '--show-toplevel']).strip()
@@ -154,40 +180,13 @@ def get_undefined_references(code):
     return undefined_references
 
 
-def get_imports_database():
-    root_path = get_project_root_path()
-
-    DATABASE_CACHE_EXPIRY = datetime.timedelta(minutes=15)
-    DATABASE_CACHES_PATH = os.path.join(
-        os.environ.get('XDG_DATA_HOME', os.path.expanduser('~/.local/share')),
-        'py_auto_import',
-        'db_cache',
-    )
-    root_path_hash = hashlib.md5(root_path.encode('utf-8')).hexdigest()
-    cache_path = os.path.join(
-        DATABASE_CACHES_PATH,
-        get_valid_filename(os.path.basename(root_path) + '_' + root_path_hash) + '.pickle'
-    )
-
-    if os.path.exists(cache_path):
-        cache_mtime = datetime.datetime.utcfromtimestamp(os.path.getmtime(cache_path))
-        if (datetime.datetime.now() - cache_mtime) < DATABASE_CACHE_EXPIRY:
-            with open(cache_path, 'rb') as cache_file:
-                return pickle.load(cache_file)
-
-    db = build_imports_database(root_path)
-    os.makedirs(DATABASE_CACHES_PATH, exist_ok=True)
-    with open(cache_path, 'wb') as cache_file:
-        pickle.dump(db, cache_file)
-    return db
-
-
 def get_missing_import_statements(code):
     # Find undefined references (an undefined reference is potentially indicative of a missing module import)
     undefined_references = get_undefined_references(code)
 
-    # Attempt to identify the an import statement that satisfies the undefined reference
-    db = get_imports_database()
+    # Attempt to identify the import statements that satisfy the undefined references
+    root_path = get_project_root_path()
+    db = get_imports_database(root_path)
 
     needed_import_statements = set()
     for name in undefined_references:
