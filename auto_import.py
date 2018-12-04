@@ -99,6 +99,7 @@ def build_imports_database(project_root_path):
     # Scan your current project's codebase for import statement patterns, to see how you commonly import different
     # names.
     # (Outsources the core file regex searching to a highly optimized utility.)
+
     if project_root_path is not None:
         ag_output = get_command_output(
             ['ag', '--python', r'^(?:from [a-zA-Z_0-9 .,]+ )?import \(?[a-zA-Z_0-9 ,]+\)?', project_root_path])
@@ -153,11 +154,13 @@ def get_imports_database(project_root_path):
     if os.path.exists(cache_path):
         cache_mtime = datetime.datetime.utcfromtimestamp(os.path.getmtime(cache_path))
         if (datetime.datetime.now() - cache_mtime) < DATABASE_CACHE_EXPIRY:
+            logging.debug('Using cached imports db {}'.format(cache_path))
             with open(cache_path, 'rb') as cache_file:
                 return pickle.load(cache_file)
 
     db = build_imports_database(project_root_path)
     os.makedirs(DATABASE_CACHES_PATH, exist_ok=True)
+    logging.debug('Writing imports db cache {}'.format(cache_path))
     with open(cache_path, 'wb') as cache_file:
         pickle.dump(db, cache_file)
     return db
@@ -180,7 +183,7 @@ def get_undefined_references(code):
     # Use Flake8 to get undefined references.
     FLAKE8_ERROR_CODE_UNDEFINED_REFERENCE = 'F821'
     flake8_report = get_command_output(
-        ['flake8', '--select', FLAKE8_ERROR_CODE_UNDEFINED_REFERENCE, '-'], stdin=code.encode('utf-8'))
+        ['python3', '-m', 'flake8', '--select', FLAKE8_ERROR_CODE_UNDEFINED_REFERENCE, '-'], stdin=code.encode('utf-8'))
 
     undefined_references = set()
     for report_line in set(flake8_report.split('\n')):
@@ -217,15 +220,11 @@ def get_missing_import_statements(code, code_base_dir):
 
 
 def verify_dependencies_installed():
-    try:
-        get_command_output(['ag', '--version'])
-    except FileNotFoundError:
+    if not get_command_output(['which', 'ag']).strip():
         raise RuntimeError(
             'Dependency \'ag\' not found. '
             'Please install the_silver_searcher via your operating system package manager.')
-    try:
-        get_command_output(['flake8', '--version'])
-    except FileNotFoundError:
+    if not get_command_output(['which', 'flake8']).strip():
         raise RuntimeError('Dependency \'flake8\' not found. Please install the flake8 pip package.')
 
 
@@ -238,8 +237,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('file', help='file to fix or \'-\' for standard in')
     parser.add_argument(
-        'base_dir',
-        default='x',
+        '--base_dir',
         help='the filesystem context for where the code would be, if using standard in (default=.)'
     )
     args = parser.parse_args()
