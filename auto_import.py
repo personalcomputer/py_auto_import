@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-
-from collections import defaultdict
 import argparse
 import datetime
 import hashlib
@@ -10,6 +8,7 @@ import pickle
 import re
 import subprocess
 import sys
+from collections import defaultdict, namedtuple
 
 PRELOADED_IMPORTS_DB = {}
 PRELOADED_IMPORTS_DB.update(
@@ -74,7 +73,7 @@ def get_valid_filename(s):
 
 
 def module_path_join(*modules):
-    return '.'.join([module.strip('.') for module in modules])
+    return '.'.join([module.strip('.') for module in modules if module])
 
 
 def construct_import_statement(terms):
@@ -88,6 +87,25 @@ def construct_import_statement(terms):
     return statement.strip()
 
 
+def parse_import_statement(statement):
+    """
+        Returns [(imported_name, terms)], where terms is a tuple describing an import statement's properties:
+        (import_base, import_name, import_alias)
+    """
+    match = re.search(
+        r'(?:from ([a-zA-Z_0-9 .,]+) )?'
+        r'import \(?([a-zA-Z_0-9 ,]+)\)?'
+        r'(?: as ([a-zA-Z_0-9.]+))?',
+        statement
+    )
+    import_base = match.group(1) if match.group(1) else None
+    import_list = [term.strip() for term in match.group(2).split(',')]
+    import_alias = match.group(3) if match.group(3) else None
+    if import_alias:
+        return [(import_alias, (import_base, import_list[0], import_alias))]
+    return [(term, (import_base, term, import_alias)) for term in import_list]
+
+
 def build_imports_database(project_root_path):
     import_freq_db = defaultdict(lambda: defaultdict(lambda: 0))
 
@@ -99,30 +117,14 @@ def build_imports_database(project_root_path):
     # Scan your current project's codebase for import statement patterns, to see how you commonly import different
     # names.
     # (Outsources the core file regex searching to a highly optimized utility.)
-
     if project_root_path is not None:
         ag_output = get_command_output(
             ['ag', '--python', r'^(?:from [a-zA-Z_0-9 .,]+ )?import \(?[a-zA-Z_0-9 ,]+\)?', project_root_path])
 
-        matches = re.findall(
-            r'(?:from ([a-zA-Z_0-9 .,]+) )?'
-            r'import \(?([a-zA-Z_0-9 ,]+)\)?'
-            r'(?: as ([a-zA-Z_0-9.]+))?',
-            ag_output
-        )
-        for match in matches:
-            import_base = match[0] if match[0] else None
-            import_list = [term.strip() for term in match[1].split(',')]
-            import_alias = match[2] if match[2] else None
-            if import_alias:
-                import_freq_db[import_alias][
-                    (import_base, import_list[0], import_alias)] += 1
-                logging.debug('Found an import pattern for {}'.format(import_alias))
-            else:
-                for term in import_list:
-                    import_freq_db[term][
-                        (import_base, term, import_alias)] += 1
-                    logging.debug('Found an import pattern for {}'.format(term))
+        for line in ag_output.split('\n'):
+            for imported_name, terms in parse_import_statement(line):
+                import_freq_db[imported_name][terms] += 1
+                logging.debug('Found an import pattern for {}'.format(imported_name))
 
     # Convert the temporary database of input patterns + their frequency to a simplified database which only provides
     # each name's single most frequently used input pattern.
@@ -137,7 +139,7 @@ def build_imports_database(project_root_path):
 def get_imports_database(project_root_path):
     DATABASE_CACHE_EXPIRY = datetime.timedelta(minutes=15)
     DATABASE_CACHES_PATH = os.path.join(
-        os.environ.get('XDG_DATA_HOME', os.path.expanduser('~/.local/share')),
+        os.environ.get('XDG_CACHE_HOME', os.path.expanduser('~/.cache')),
         'py_auto_import',
         'db_cache',
     )
@@ -180,19 +182,56 @@ def get_project_root_path(code_base_dir):
 
 
 def get_undefined_references(code):
-    # Use Flake8 to get undefined references.
-    FLAKE8_ERROR_CODE_UNDEFINED_REFERENCE = 'F821'
-    flake8_report = get_command_output(
-        ['python3', '-m', 'flake8', '--select', FLAKE8_ERROR_CODE_UNDEFINED_REFERENCE, '-'], stdin=code.encode('utf-8'))
+    # Use Pyflakes to get undefined references.
+    linter_report = get_command_output(
+        ['python3', '-m', 'pyflakes'], stdin=code.encode('utf-8'))
 
     undefined_references = set()
-    for report_line in set(flake8_report.split('\n')):
+    for report_line in set(linter_report.split('\n')):
         if not report_line:
             continue
         match = re.search(r'undefined name \'([^\']+)\'', report_line)
+        if not match:
+            continue
         undefined_references.add(match.group(1))
 
     return undefined_references
+
+
+def get_unused_import_statements_with_fixes(code):
+    """
+        returns (unused_import_lines, unused_import_fix_statements)
+    """
+    # Use Pyflakes to get unused imports.
+    linter_report = get_command_output(
+        ['python3', '-m', 'pyflakes'], stdin=code.encode('utf-8'))
+
+    code_lines = code.split('\n')
+
+    unused_import_lines = []
+    unused_import_fix_statements = []
+    for report_line in set(linter_report.split('\n')):
+        if not report_line:
+            continue
+        match = re.search(r'(\d+): \'([^\']+)\' imported but unused', report_line)
+        if not match:
+            continue
+
+        line_number = int(match.group(1))
+        unused_name_msg = match.group(2)
+        unused_module = re.match(r'(\S+)', unused_name_msg).group(1)
+        code = code_lines[line_number - 1]
+        desired_import_terms = []
+        for _, terms in parse_import_statement(code):
+            if module_path_join(terms[0], terms[1]) != unused_module:
+                desired_import_terms.append(terms)
+
+        code_fixed = [construct_import_statement(terms) for terms in desired_import_terms]
+        unused_import_lines.append(line_number)
+        if code_fixed:
+            unused_import_fix_statements.extend(code_fixed)
+
+    return unused_import_lines, unused_import_fix_statements
 
 
 def get_missing_import_statements(code, code_base_dir):
@@ -224,8 +263,8 @@ def verify_dependencies_installed():
         raise RuntimeError(
             'Dependency \'ag\' not found. '
             'Please install the_silver_searcher via your operating system package manager.')
-    if not get_command_output(['which', 'flake8']).strip():
-        raise RuntimeError('Dependency \'flake8\' not found. Please install the flake8 pip package.')
+    if not get_command_output(['which', 'pyflakes']).strip():
+        raise RuntimeError('Dependency \'pyflakes\' not found. Please install the pyflakes pip package.')
 
 
 def main():
@@ -251,12 +290,16 @@ def main():
             code = input_file.read()
         code_base_dir = os.path.dirname(os.path.abspath(args.file))
 
-    # Find missing import statements
+    # Find missing or unused import statements
     needed_import_statements = get_missing_import_statements(code, code_base_dir)
+    unused_import_lines, unused_import_fix_statements = get_unused_import_statements_with_fixes(code)
 
     # Output
     if needed_import_statements:
-        print(str('\n'.join(sorted(needed_import_statements))))
+        print(str('\n'.join(['Add: ' + statement for statement in sorted(needed_import_statements)])))
+    if unused_import_lines:
+        print(str('\n'.join(['Remove L' + str(line_number) for line_number in sorted(unused_import_lines)])))
+        print(str('\n'.join(['Add: ' + statement for statement in sorted(unused_import_fix_statements)])))
 
 
 if __name__ == '__main__':
