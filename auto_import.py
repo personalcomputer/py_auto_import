@@ -8,7 +8,7 @@ import pickle
 import re
 import subprocess
 import sys
-from collections import defaultdict, namedtuple
+from collections import defaultdict
 
 PRELOADED_IMPORTS_DB = {}
 PRELOADED_IMPORTS_DB.update(
@@ -43,7 +43,6 @@ PRELOADED_IMPORTS_DB.update({
     'namedtuple': ('collections', 'namedtuple', None),
     'OrderedDict': ('collections', 'OrderedDict', None),
 
-    'argparse': (None, 'argparse', None),
     'np': (None, 'numpy', 'np'),
     'numpy': (None, 'numpy', None),
     'pd': (None, 'pandas', 'pd'),
@@ -54,12 +53,21 @@ PRELOADED_IMPORTS_DB.update({
 
 
 def get_command_output(cmd, stdin=None, cwd=None):
-    raw_output, _ = subprocess.Popen(
+    raw_output, raw_error = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stdin=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         cwd=cwd
     ).communicate(stdin)
+    if raw_error:
+        cmd_rendered = ' '.join(cmd)
+        logging.warning('Error when running command `{}`{}: "{}"{}'.format(
+            cmd_rendered[:200],
+            '[... command truncated]' if len(cmd_rendered) > 200 else '',
+            raw_error[:200],
+            '[... error truncated]' if len(raw_error) > 200 else '',
+        ))
     return raw_output.decode('utf-8')
 
 
@@ -72,7 +80,7 @@ def get_valid_filename(s):
     return re.sub(r'(?u)[^-\w.]', '', s)
 
 
-def module_path_join(*modules):
+def module_path_join(modules):
     return '.'.join([module.strip('.') for module in modules if module])
 
 
@@ -94,10 +102,12 @@ def parse_import_statement(statement):
     """
     match = re.search(
         r'(?:from ([a-zA-Z_0-9 .,]+) )?'
-        r'import \(?([a-zA-Z_0-9 ,]+)\)?'
+        r'import \(?((?:[a-zA-Z_0-9]+(?:, )?)+)\)?'
         r'(?: as ([a-zA-Z_0-9.]+))?',
         statement
     )
+    if not match:
+        raise RuntimeError('Failed to parse import statement: ' + statement)
     import_base = match.group(1) if match.group(1) else None
     import_list = [term.strip() for term in match.group(2).split(',')]
     import_alias = match.group(3) if match.group(3) else None
@@ -119,9 +129,12 @@ def build_imports_database(project_root_path):
     # (Outsources the core file regex searching to a highly optimized utility.)
     if project_root_path is not None:
         ag_output = get_command_output(
-            ['ag', '--python', r'^(?:from [a-zA-Z_0-9 .,]+ )?import \(?[a-zA-Z_0-9 ,]+\)?', project_root_path])
+            ['ag', '--python', '--nonumbers', '--noheading', '--nofilename', '--nobreak',
+            r'^(?:from [a-zA-Z_0-9 .,]+ )?import \(?[a-zA-Z_0-9 ,]+\)?', project_root_path])
 
         for line in ag_output.split('\n'):
+            if not line:
+                continue
             for imported_name, terms in parse_import_statement(line):
                 import_freq_db[imported_name][terms] += 1
                 logging.debug('Found an import pattern for {}'.format(imported_name))
@@ -184,7 +197,7 @@ def get_project_root_path(code_base_dir):
 def get_undefined_references(code):
     # Use Pyflakes to get undefined references.
     linter_report = get_command_output(
-        ['python3', '-m', 'pyflakes'], stdin=code.encode('utf-8'))
+        ['/usr/bin/env', 'python3', '-m', 'pyflakes'], stdin=code.encode('utf-8'))
 
     undefined_references = set()
     for report_line in set(linter_report.split('\n')):
@@ -204,33 +217,45 @@ def get_unused_import_statements_with_fixes(code):
     """
     # Use Pyflakes to get unused imports.
     linter_report = get_command_output(
-        ['python3', '-m', 'pyflakes'], stdin=code.encode('utf-8'))
+        ['/usr/bin/env', 'python3', '-m', 'pyflakes'], stdin=code.encode('utf-8'))
 
     code_lines = code.split('\n')
-
     unused_import_lines = []
-    unused_import_fix_statements = []
+    expanded_import_terms = set()
+    unused_module_names = set()
+    # For every linter error, expand the import terms from that line, make a note to delete the entire line, and record
+    # the unused package name in the error.
     for report_line in set(linter_report.split('\n')):
+        print(report_line)
         if not report_line:
             continue
-        match = re.search(r'(\d+): \'([^\']+)\' imported but unused', report_line)
+        match = re.search(r':(\d+)(?::\d+)? \'([^\']+)\' imported but unused', report_line)
         if not match:
             continue
 
         line_number = int(match.group(1))
         unused_name_msg = match.group(2)
         unused_module = re.match(r'(\S+)', unused_name_msg).group(1)
+
         code = code_lines[line_number - 1]
-        desired_import_terms = []
-        for _, terms in parse_import_statement(code):
-            if module_path_join(terms[0], terms[1]) != unused_module:
-                desired_import_terms.append(terms)
+        if 'import' not in code or '(' in code or code[-1] == '\\':
+            # If either import keyword does not appear anywhere in the line or ( appears, then we can be sure this is
+            # part of a multi-line import statement. We cannot handle fixing multi-line imports with our simplistic
+            # parsing, so ignore it.
+            continue
 
-        code_fixed = [construct_import_statement(terms) for terms in desired_import_terms]
+        expanded_import_terms.update([x[1] for x in parse_import_statement(code)])
         unused_import_lines.append(line_number)
-        if code_fixed:
-            unused_import_fix_statements.extend(code_fixed)
+        unused_module_names.add(unused_module)
 
+    # For every unused module name, filter out its import(s) from expanded_import_terms
+    expanded_import_terms = [
+        terms for terms in expanded_import_terms
+        if module_path_join([terms[0], terms[1]]) not in unused_module_names
+    ]
+
+    # Rewrite the import statements from the (now filtered) expanded import terms
+    unused_import_fix_statements = [construct_import_statement(terms) for terms in expanded_import_terms]
     return unused_import_lines, unused_import_fix_statements
 
 
@@ -277,7 +302,9 @@ def main():
     parser.add_argument('file', help='file to fix or \'-\' for standard in')
     parser.add_argument(
         '--base_dir',
-        help='the filesystem context for where the code would be, if using standard in (default=.)'
+        help='the filesystem directory for where the code would be, if using standard in. This provides context for '
+             'determining what import statements and import styles are preferred across a codebase. (default=.)',
+        default='.',
     )
     args = parser.parse_args()
 
